@@ -4,20 +4,37 @@
 //
 //近くの温湿度計から発せられるBLE信号をキャッチし、Ambientへデータを送ります。
 
+// ローカル用(Wifi, Ambient埋め込み)
+// 2023.07
+// 温湿度計Plusに対応する。
+// 防水温湿度計に対応する。
+// Wifi不安定対策をする。
+// アドレス固定の対策をする。
+
+// ArduinoIDE [ﾂｰﾙ]-[Partition Scheme:"NO OTA(Large APP)"]にする。
+
 #include <M5Atom.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <FS.h>
+#include <SPIFFS.h>
 #include "Ambient.h"
 
-#define  RGB(r, g, b)  (((r) << 16) + ((g) << 8) + (b))
+/* You only need to format SPIFFS the first time you run a
+   test or else use the SPIFFS plugin to create a partition
+   https://github.com/me-no-dev/arduino-esp32fs-plugin */
+#define FORMAT_SPIFFS_IF_FAILED true
+
+#define RGB(r, g, b)  (((r) << 16) + ((g) << 8) + (b))
 
 #define SECONDS(s)    ((s) * 1000)
 #define MINUTES(m)    SECONDS(m * 60)
 
 #define SWITCHBOT_SD_SIZE 6
 #define CYALKIT_MD_SIZE 25
+#define SWITCHBOT_MD_SIZE 14
 
 typedef struct {
   // Byte:0 Enc Type Dev Type
@@ -45,6 +62,26 @@ typedef struct {
 } SwitchBotServiceData;
 
 typedef struct {
+  // Byte:0-1
+  uint16_t  companyID;  // 0x0969
+  // Byte:2-7
+  char      mac[6];     // mac
+  // Byte:8-9 ?
+  uint8_t reserved1;
+  uint8_t reserved2;
+  // Byte:10
+  uint8_t decimalOfTheTemperature : 4;
+  uint8_t humidityAlertStatus : 2;    //?
+  uint8_t temperatureAlertStatus : 2; //?
+  // Byte:11
+  uint8_t integerOfTheTemperature : 7;
+  uint8_t posiNegaTemperatureFlag : 1;
+  // Byte:12
+  uint8_t humidityValue : 7;
+  uint8_t temperatureScale : 1;
+} SwitchBotManufacturerData;
+
+typedef struct {
   // AD Data 25 bytes
   uint16_t  companyID;  // 0x004C
   uint8_t   deviceType; // 0x02
@@ -64,52 +101,139 @@ int skipCount = skipResetCount;
 
 BLEScan* pBLEScan;
 
-#define MAX_ADDRESS 8
-
-int nAddresses = 0;
-std::string addresses[MAX_ADDRESS];
-
-
 boolean fConnect = false;
 WiFiClient client;
 // Wi-Fi こちらの値を適宜書き換えてご使用ください。
-const char * ssid     = "XXXX";
-const char * password = "XXXX";
+const char * ssid     = "xxxx";
+const char * password = "xxxx";
 
 Ambient ambient;
 // こちらの値を適宜書き換えてご使用ください。
 unsigned int channelId = 0; // AmbientのチャネルID
 const char* writeKey = "xxxx"; // ライトキー
 
-void
-printAddressPos(void)
+// MACアドレスの登録管理
+#define MAX_ADDRESS 8
+#define FNAME       "/addr.txt"
+
+int nAddresses = 0;
+String addresses[MAX_ADDRESS];
+
+void initAddressPos(void)
+{
+  Serial.print("initAddressPos()...");
+  if(!SPIFFS.begin(FORMAT_SPIFFS_IF_FAILED)){
+      Serial.println("SPIFFS Mount Failed");
+      return;
+  }
+  Serial.println("OK");
+
+  nAddresses = 0;
+  for (int i = 0; i < MAX_ADDRESS; i++)
+    addresses[i] = String("");
+}
+
+void printAddressPos(void)
 {
   Serial.printf("***** printAddressPos(%d) *****\n", nAddresses);
   int loopCount = (nAddresses < MAX_ADDRESS) ? nAddresses : MAX_ADDRESS;
   for (int i = 0; i < loopCount; i++)
-    Serial.printf("address[%d]:%s\n", i, addresses[i]);
+    Serial.printf(" address[%d]:'%s'\n", i, addresses[i].c_str());
   Serial.printf("*****\n");
 }
 
-int getAddressPos(const std::string tAddress)
+void loadAddressPos(void)
 {
-  // 見つけたMACアドレス毎に番号を振り、その番号でAmbientへデータを書き込む。
+  Serial.println("loadAddressPos():");
+  File file = SPIFFS.open(FNAME, FILE_READ);
+  if(!file){
+      Serial.println(" failed to open");
+      nAddresses = 0;
+      for (int i = 0; i < MAX_ADDRESS; i++)
+        addresses[i] = String("");
+      return;
+  }
+  nAddresses = file.readStringUntil('\n').toInt();
+  Serial.printf(" nAddresses:%d\n", nAddresses);
+  for (int i = 0; i < MAX_ADDRESS; i++) {
+    String s = file.readStringUntil('\n');
+    Serial.printf(" ***address[%d]:'%s'\n", i, s.c_str());
+    addresses[i] = s;
+  }
+  file.close();
+  printAddressPos();
+}
+
+void verifyAddressPos(void)
+{
+  Serial.println("verifyAddressPos():");
+  File file = SPIFFS.open(FNAME, FILE_READ);
+  if(!file){
+      Serial.println(" failed to open");
+      return;
+  }
+  int n = file.readStringUntil('\n').toInt();
+  Serial.printf(" nAddresses:%d\n", n);
+  for (int i = 0; i < MAX_ADDRESS; i++) {
+    String s = file.readStringUntil('\n');
+    Serial.printf(" ***address[%d]:'%s'\n", i, s.c_str());
+  }
+  file.close();
+}
+
+void saveAddressPos(void)
+{
+  Serial.println("saveAddressPos():");
+  File file = SPIFFS.open(FNAME, FILE_WRITE);
+  if(!file || file.isDirectory()){
+      Serial.println(" failed to open");
+      return;
+  }
+  file.println(nAddresses);
+  Serial.printf(" nAddresses:%d\n", nAddresses);
+  for (int i = 0; i < MAX_ADDRESS; i++) {
+    String s = addresses[i];
+    file.println(s);
+    Serial.printf(" address[%d]:'%s'\n", i, s.c_str());
+  }
+  file.close();
+}
+
+void clearAddressPos(void)
+{
+  Serial.println("clearAddressPos()");
+  SPIFFS.remove(FNAME);
+  nAddresses = 0;
+  for (int i = 0; i < MAX_ADDRESS; i++)
+    addresses[i] = String("");
+}
+
+int getAddressPos(String tAddress)
+{
+  // 見つけた文字列毎に番号を振り、その番号を返す。
   // 最大数を超えた場合、-1を返す。
-  bool fFound = false;
-  int pos = -1;
-  int loopCount = (nAddresses < MAX_ADDRESS) ? nAddresses : MAX_ADDRESS;
-  for (int i = 0; i < loopCount; i++) {
-    if (tAddress == addresses[i]) {
-      fFound = true;
-      pos = i;
-      continue;
+  Serial.printf("getAddressPos('%s'): nAddresses:%d\n", tAddress.c_str(), nAddresses);
+  for (int i = 0; i < nAddresses; i++) {
+    tAddress.trim();
+    addresses[i].trim();
+    Serial.printf(" tAddress:'%s' addresses[%d]:'%s'\n", tAddress.c_str(), i, addresses[i].c_str());
+    if (tAddress.equals(addresses[i])) {
+      // すでにストアされている場合、そのインデックスを返す
+      Serial.printf(" Found:%d\n", i);
+      return i;
     }
   }
-  if ((nAddresses < MAX_ADDRESS) && !fFound) {
-    pos = nAddresses;
+
+  if (nAddresses < MAX_ADDRESS) {
+    // 新たにストアして、インデックスを返す
     addresses[nAddresses++] = tAddress;
+    Serial.printf(" New:%d\n", nAddresses - 1);
+    return nAddresses - 1;
   }
-  return pos;
+
+  // 最大数を超えた場合は-1を返す
+  Serial.println(" Not found:-1");
+  return -1;
 }
 
 class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
@@ -118,13 +242,13 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
     static int ff = 1;
     M5.dis.drawpix(4, 4, (ff ^= 1) ? RGB(0x40, 0x00, 0x00) : 0);
 
-    Serial.printf("Advertised Device: %s \n", advertisedDevice.toString().c_str());
+    Serial.printf("AD:%s\n", advertisedDevice.toString().c_str());
 
     BLEAddress address = advertisedDevice.getAddress();
 
     if (advertisedDevice.haveServiceData()) {
       std::string d = advertisedDevice.getServiceData();
-      Serial.printf("ServiceData(%d):", d.size());
+      Serial.printf("SD(%d):", d.size());
       for (int i = 0; i < d.size(); i++) {
         Serial.printf("%02X", d[i]);
       }
@@ -138,23 +262,21 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
       memcpy(&sd, advertisedDevice.getServiceData().data(),
           advertisedDevice.getServiceData().length());
 
-      if (sd.deviceType == 'T') { // SwitchBot MeterTH (WoSensorTH) Normal Mode
+      if (sd.deviceType == 'T' || sd.deviceType == 'i') { // SwitchBot MeterTH or MeterPlus
 
         float temperature = ((sd.posiNegaTemperatureFlag) ? 1.0 : -1.0) *
                             (sd.decimalOfTheTemperature * 0.1 +
                              sd.integerOfTheTemperature);
         float humidity = (float)sd.humidityValue;
 
-        Serial.printf("temperature:%.1f\n", temperature);
-        Serial.printf("humidity:%.1f\n", humidity);
+        Serial.printf("temp:%.1f\n", temperature);
+        Serial.printf("humi:%.1f\n", humidity);
 
         //温度のみ送信する。
-        if (fConnect) {
-          int pos = getAddressPos(address.toString());
-          if (pos >= 0) {
-            ambient.set(pos + 1, temperature);
-            Serial.printf("ambient.set(%d, %.1f);\n", pos + 1, temperature);
-          }
+        int pos = getAddressPos(String(address.toString().c_str()));
+        if (pos >= 0 && fConnect) {
+          ambient.set(pos + 1, temperature);
+          Serial.printf("ambient.set(%d, %.1f);\n", pos + 1, temperature);
         }
 
         Serial.printf("SwitchBotServiceData:\n");
@@ -174,6 +296,45 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
       }
     }
 
+    // Switchbot防水温湿度計を特定する。
+    if (advertisedDevice.haveManufacturerData() == true
+        && advertisedDevice.getManufacturerData().length() == SWITCHBOT_MD_SIZE) {
+
+      SwitchBotManufacturerData md;
+      memcpy(&md, advertisedDevice.getManufacturerData().data(),
+          advertisedDevice.getManufacturerData().length());
+
+      if (md.companyID == 0x0969) {
+        float temperature = ((md.posiNegaTemperatureFlag) ? 1.0 : -1.0) *
+                            (md.decimalOfTheTemperature * 0.1 +
+                             md.integerOfTheTemperature);
+        float humidity = (float)md.humidityValue;
+
+        Serial.printf("temp:%.1f\n", temperature);
+        Serial.printf("humi:%.1f\n", humidity);
+
+        //温度のみ送信する。
+        int pos = getAddressPos(String(address.toString().c_str()));
+        if (pos >= 0 && fConnect) {
+          ambient.set(pos + 1, temperature);
+          Serial.printf("ambient.set(%d, %.1f);\n", pos + 1, temperature);
+        }
+      }
+
+      Serial.printf("SwitchbotManufacturerData(%d):\n", advertisedDevice.getManufacturerData().length());
+      Serial.printf("   companyID:%04x\n", md.companyID);
+      Serial.printf("   mac:%02x:%02x:%02x:%02x\n", md.mac[0], md.mac[1], md.mac[2], md.mac[3]);
+      Serial.printf("   reserved1:%02x\n", md.reserved1);
+      Serial.printf("   reserved2:%02x\n", md.reserved2);
+      Serial.printf("   decimalOfTheTemperature:%02x\n", md.decimalOfTheTemperature);
+      Serial.printf("   humidityAlertStatus:%02x\n", md.humidityAlertStatus);
+      Serial.printf("   temperatureAlertStatus:%02x\n", md.temperatureAlertStatus);
+      Serial.printf("   integerOfTheTemperature:%02x\n", md.integerOfTheTemperature);
+      Serial.printf("   posiNegaTemperatureFlag:%02x\n", md.posiNegaTemperatureFlag);
+      Serial.printf("   humidityValue:%02x\n", md.humidityValue);
+      Serial.printf("   temperatureScale:%02x\n", md.temperatureScale);
+    }
+    
     // CYALKIT温湿度計を特定する。
     if (advertisedDevice.haveManufacturerData() == true
         && advertisedDevice.getManufacturerData().length() == CYALKIT_MD_SIZE) {
@@ -185,16 +346,14 @@ class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
         float temperature = (float)(175.72 * (md.temp * 256.0) / 65536.0 - 46.85);
         float humidity = (float)(125.0 * (md.humidity * 256.0) / 65536.0 - 6.0);
 
-        Serial.printf("temperature:%.1f\n", temperature);
-        Serial.printf("humidity:%.1f\n", humidity);
+        Serial.printf("temp:%.1f\n", temperature);
+        Serial.printf("humi:%.1f\n", humidity);
 
         //温度のみ送信する。
-        if (fConnect) {
-          int pos = getAddressPos(address.toString());
-          if (pos >= 0) {
-            ambient.set(pos + 1, temperature);
-            Serial.printf("ambient.set(%d, %.1f);\n", pos + 1, temperature);
-          }
+        int pos = getAddressPos(String(address.toString().c_str()));
+        if (pos >= 0 && fConnect) {
+          ambient.set(pos + 1, temperature);
+          Serial.printf("ambient.set(%d, %.1f);\n", pos + 1, temperature);
         }
 
         Serial.printf("CyalkitManufacturerData:\n");
@@ -232,6 +391,14 @@ void dispLCD(int skipCount)
 void setup() {
   M5.begin(true, false, true);
   Serial.begin(115200);
+
+  // Wifi不安定対策:大野さんのアドバイスによる
+  pinMode(0, OUTPUT);
+  digitalWrite(0, LOW);
+
+  initAddressPos();
+  loadAddressPos();
+  
   Serial.println("Scanning...");
 
   BLEDevice::init("M5Atom");
@@ -258,6 +425,14 @@ void setup() {
 }
 
 void loop() {
+  M5.update();
+
+  if (M5.Btn.wasReleasefor(3000)) {
+    clearAddressPos();
+    for (int i; i < 25; i++)
+      M5.dis.drawpix(i, 0);
+  }
+  
   dispLCD(skipCount);
   if (--skipCount < 0) {
     skipCount = skipResetCount;
@@ -271,6 +446,8 @@ void loop() {
   Serial.println("Scan done!");
   pBLEScan->clearResults();   // delete results fromBLEScan buffer to release memory
 
+  saveAddressPos();
+  verifyAddressPos();
   printAddressPos();
 
   delay(SECONDS(waitTime));
